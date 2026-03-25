@@ -7,42 +7,113 @@ on:
     branches: [master]
 
 jobs:
-  build:
+  validate:
+    name: Validate app configs
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 8.0.x
+      - name: Check required files exist
+        run: |
+          errors=0
+          for dir in apps/*/; do
+            app=$(basename "$dir")
+            for f in "$dir$app.yaml" "$dir/docker-compose.override.yml" "$dir/src/docker-compose.yml" "$dir/src/Dockerfile"; do
+              if [ ! -f "$f" ]; then
+                echo "FAIL: missing $f"
+                errors=$((errors+1))
+              fi
+            done
+          done
+          if [ $errors -gt 0 ]; then exit 1; fi
+          echo "All app files present"
 
-      - name: Build
-        run: dotnet build src/paas-deploy.csproj -c Release
+      - name: Validate compose configs
+        run: |
+          docker network create traefik
+          for dir in apps/*/; do
+            app=$(basename "$dir")
+            echo "Validating $app..."
+            docker compose \
+              -f "$dir/src/docker-compose.yml" \
+              -f "$dir/docker-compose.override.yml" \
+              config --quiet
+          done
+          echo "All compose configs valid"
 
-      - name: Login to GHCR
-        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+  deploy-test:
+    name: Build, deploy, and test hello-world
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
-        uses: docker/setup-buildx-action@v3
+      - name: Create traefik network
+        run: docker network create traefik
 
-      - name: Build and push Docker image
-        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/be-pongit/paas-deploy:latest
-            ghcr.io/be-pongit/paas-deploy:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Build and deploy
+        run: make deploy name=hello-world build=local
+
+      - name: Wait for container to be healthy
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+              echo "Health check passed"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Health check failed after 30s"
+          docker ps -a
+          docker logs hello-world-hello-world-1 || true
+          exit 1
+
+      - name: Test root endpoint
+        run: |
+          response=$(curl -sf http://localhost:8080/)
+          echo "Response: $response"
+          if [[ "$response" != *"Hello World"* ]]; then
+            echo "Unexpected response"
+            exit 1
+          fi
+
+      - name: Test make status
+        run: make status
+
+      - name: Test make logs (snapshot)
+        run: |
+          docker compose \
+            -f apps/hello-world/src/docker-compose.yml \
+            -f apps/hello-world/docker-compose.override.yml \
+            -p hello-world logs --tail=5
+
+      - name: Test make stop
+        run: |
+          make stop name=hello-world
+          if docker ps --filter name=hello-world --format '{{.Names}}' | grep -q hello-world; then
+            echo "Container still running after stop"
+            exit 1
+          fi
+          echo "Stop verified"
+
+      - name: Test make validate
+        run: make validate
+
+  infra-validate:
+    name: Validate infrastructure configs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create traefik network
+        run: docker network create traefik
+
+      - name: Validate infra compose files
+        run: |
+          for dir in infra/*/; do
+            svc=$(basename "$dir")
+            if [ -f "$dir/docker-compose.yml" ]; then
+              echo "Validating $svc..."
+              docker compose -f "$dir/docker-compose.yml" config --quiet
+            fi
+          done
+          echo "All infra configs valid"

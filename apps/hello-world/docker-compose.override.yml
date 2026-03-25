@@ -5,7 +5,8 @@ services:
       - "traefik.http.routers.hello-world.rule=Host(`hello-world.pongit.be`)"
       - "traefik.http.routers.hello-world.tls.certresolver=letsencrypt"
     env_file:
-      - ../hello-world.env
+      - path: ../hello-world.env.dec
+        required: false
     networks:
       - traefik
 

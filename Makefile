@@ -1,46 +1,73 @@
-.PHONY: deploy onboard status logs infra-up infra-down help
+.PHONY: deploy stop logs status onboard infra-up infra-down help validate
 
 SHELL := /bin/bash
 
+# Remote deploy: set DEPLOY_HOST=user@synology-ip to deploy over SSH
+# Docker compose uses DOCKER_HOST under the hood for transparent remote execution
+ifdef DEPLOY_HOST
+  DOCKER_CMD := DOCKER_HOST=ssh://$(DEPLOY_HOST) docker
+  COMPOSE_CMD := DOCKER_HOST=ssh://$(DEPLOY_HOST) docker compose
+else
+  DOCKER_CMD := docker
+  COMPOSE_CMD := docker compose
+endif
+
 # Parse app config
-app_yaml = apps/$(name)/$(name).yaml
-app_src = apps/$(name)/src
-app_override = apps/$(name)/docker-compose.override.yml
-app_env = apps/$(name)/$(name).env
+app_dir    = apps/$(name)
+app_yaml   = $(app_dir)/$(name).yaml
+app_src    = $(app_dir)/src
+app_override = $(app_dir)/docker-compose.override.yml
+app_env    = $(app_dir)/$(name).env
+app_env_dec = $(app_dir)/$(name).env.dec
+
+# Compose file args
+compose_files = -f $(app_src)/docker-compose.yml -f $(app_override)
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-deploy: ## Deploy an app. Usage: make deploy name=hello-world [build=local] [tag=v2026-03-25-abc1234]
+deploy: ## Deploy an app. Usage: make deploy name=hello-world [build=local] [tag=v2026-03-25-abc] [DEPLOY_HOST=user@host]
 	@if [ -z "$(name)" ]; then echo "Error: name is required. Usage: make deploy name=hello-world"; exit 1; fi
 	@if [ ! -f $(app_yaml) ]; then echo "Error: $(app_yaml) not found"; exit 1; fi
 	@enabled=$$(grep '^enabled:' $(app_yaml) | awk '{print $$2}'); \
 	if [ "$$enabled" != "true" ]; then echo "App '$(name)' is disabled. Set enabled: true in $(app_yaml)"; exit 1; fi
+	@# Decrypt secrets if SOPS-encrypted
+	@if [ -f $(app_env) ]; then \
+		if head -1 $(app_env) | grep -q "^sops_"; then \
+			echo "==> Decrypting secrets..."; \
+			sops -d $(app_env) > $(app_env_dec); \
+		else \
+			cp $(app_env) $(app_env_dec); \
+		fi; \
+	fi
 	@echo "==> Deploying $(name)..."
 	@if [ "$(build)" = "local" ]; then \
 		echo "==> Building locally..."; \
-		docker compose -f $(app_src)/docker-compose.yml -f $(app_override) build; \
+		$(COMPOSE_CMD) $(compose_files) build; \
 	elif [ -n "$(tag)" ]; then \
 		echo "==> Using tag: $(tag)"; \
 	else \
 		echo "==> Pulling latest image..."; \
-		docker compose -f $(app_src)/docker-compose.yml -f $(app_override) pull; \
+		$(COMPOSE_CMD) $(compose_files) pull; \
 	fi
 	@echo "==> Starting containers..."
-	docker compose -f $(app_src)/docker-compose.yml -f $(app_override) \
-		-p $(name) up -d
+	$(COMPOSE_CMD) $(compose_files) -p $(name) up -d
 	@echo "==> $(name) deployed successfully"
+	@# Cleanup decrypted secrets
+	@rm -f $(app_env_dec)
 
 stop: ## Stop an app. Usage: make stop name=hello-world
 	@if [ -z "$(name)" ]; then echo "Error: name is required"; exit 1; fi
-	docker compose -f $(app_src)/docker-compose.yml -f $(app_override) \
-		-p $(name) down
+	$(COMPOSE_CMD) $(compose_files) -p $(name) down
+
+restart: ## Restart an app. Usage: make restart name=hello-world
+	@if [ -z "$(name)" ]; then echo "Error: name is required"; exit 1; fi
+	$(COMPOSE_CMD) $(compose_files) -p $(name) restart
 
 logs: ## Tail logs for an app. Usage: make logs name=hello-world
 	@if [ -z "$(name)" ]; then echo "Error: name is required"; exit 1; fi
-	docker compose -f $(app_src)/docker-compose.yml -f $(app_override) \
-		-p $(name) logs -f
+	$(COMPOSE_CMD) $(compose_files) -p $(name) logs -f
 
 status: ## Show status of all apps
 	@echo "==> App Status"
@@ -60,7 +87,7 @@ status: ## Show status of all apps
 	done
 	@echo ""
 	@echo "==> Running Containers"
-	@docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+	@$(DOCKER_CMD) ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
 
 onboard: ## Onboard a new app. Usage: make onboard repo=https://github.com/user/app name=myapp
 	@if [ -z "$(name)" ]; then echo "Error: name is required"; exit 1; fi
@@ -69,22 +96,62 @@ onboard: ## Onboard a new app. Usage: make onboard repo=https://github.com/user/
 	@echo "==> Onboarding $(name) from $(repo)..."
 	mkdir -p apps/$(name)
 	git clone --depth 1 $(repo) apps/$(name)/src
-	@echo "enabled: true" > apps/$(name)/$(name).yaml
-	@echo "repo: $(repo)" >> apps/$(name)/$(name).yaml
-	@echo "image: ghcr.io/be-pongit/$(name)" >> apps/$(name)/$(name).yaml
-	@echo "domain: $(name).pongit.be" >> apps/$(name)/$(name).yaml
+	@echo "enabled: true" > $(app_yaml)
+	@echo "repo: $(repo)" >> $(app_yaml)
+	@echo "image: ghcr.io/be-pongit/$(name)" >> $(app_yaml)
+	@echo "domain: $(name).pongit.be" >> $(app_yaml)
 	@echo "==> Created $(app_yaml) — edit domain and image as needed"
 	@echo "==> Create $(app_override) with Traefik labels"
-	@echo "==> Create $(app_env) with SOPS-encrypted secrets"
+	@echo "==> Create $(app_env) with secrets"
 	@echo "==> Done. Deploy with: make deploy name=$(name) build=local"
+
+validate: ## Validate all app configs
+	@echo "==> Validating app configs..."
+	@errors=0; \
+	for dir in apps/*/; do \
+		app=$$(basename $$dir); \
+		yaml="$$dir$$app.yaml"; \
+		override="$$dir/docker-compose.override.yml"; \
+		src_compose="$$dir/src/docker-compose.yml"; \
+		if [ ! -f "$$yaml" ]; then \
+			echo "  FAIL  $$app: missing $$yaml"; errors=$$((errors+1)); \
+		else \
+			echo "  OK    $$app: $$yaml"; \
+		fi; \
+		if [ ! -f "$$override" ]; then \
+			echo "  FAIL  $$app: missing docker-compose.override.yml"; errors=$$((errors+1)); \
+		else \
+			echo "  OK    $$app: docker-compose.override.yml"; \
+		fi; \
+		if [ ! -f "$$src_compose" ]; then \
+			echo "  FAIL  $$app: missing src/docker-compose.yml"; errors=$$((errors+1)); \
+		else \
+			echo "  OK    $$app: src/docker-compose.yml"; \
+		fi; \
+		if [ -f "$$src_compose" ] && [ -f "$$override" ]; then \
+			if docker compose -f "$$src_compose" -f "$$override" config > /dev/null 2>&1; then \
+				echo "  OK    $$app: compose config valid"; \
+			else \
+				echo "  FAIL  $$app: compose config invalid"; errors=$$((errors+1)); \
+			fi; \
+		fi; \
+	done; \
+	echo ""; \
+	if [ $$errors -gt 0 ]; then \
+		echo "==> $$errors error(s) found"; exit 1; \
+	else \
+		echo "==> All apps valid"; \
+	fi
 
 infra-up: ## Start all infrastructure services
 	@echo "==> Starting infrastructure..."
+	@# Ensure traefik network exists
+	@$(DOCKER_CMD) network inspect traefik >/dev/null 2>&1 || $(DOCKER_CMD) network create traefik
 	@for dir in infra/*/; do \
 		svc=$$(basename $$dir); \
 		if [ -f "$$dir/docker-compose.yml" ]; then \
 			echo "  Starting $$svc..."; \
-			docker compose -f $$dir/docker-compose.yml -p $$svc up -d; \
+			$(COMPOSE_CMD) -f $$dir/docker-compose.yml -p $$svc up -d; \
 		fi; \
 	done
 	@echo "==> Infrastructure up"
@@ -95,7 +162,7 @@ infra-down: ## Stop all infrastructure services
 		svc=$$(basename $$dir); \
 		if [ -f "$$dir/docker-compose.yml" ]; then \
 			echo "  Stopping $$svc..."; \
-			docker compose -f $$dir/docker-compose.yml -p $$svc down; \
+			$(COMPOSE_CMD) -f $$dir/docker-compose.yml -p $$svc down; \
 		fi; \
 	done
 	@echo "==> Infrastructure down"

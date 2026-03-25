@@ -5,3 +5,4 @@
 *.user
 .claude/
 _bmad/
+*.env.dec
