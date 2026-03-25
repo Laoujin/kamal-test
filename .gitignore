@@ -1,0 +1,5 @@
+**/bin
+**/obj
+.kamal/secrets
+.vs/
+*.user

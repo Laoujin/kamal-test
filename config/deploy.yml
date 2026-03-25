@@ -1,0 +1,22 @@
+service: paas-deploy
+image: ghcr.io/be-pongit/paas-deploy
+
+servers:
+  web:
+    hosts:
+      - SYNOLOGY_IP_HERE
+
+proxy:
+  ssl: true
+  host: test.pongit.be
+  app_port: 8080
+
+registry:
+  server: ghcr.io
+  username:
+    - KAMAL_REGISTRY_USERNAME
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+ssh:
+  user: SYNOLOGY_USER_HERE
