@@ -2,3 +2,6 @@ creation_rules:
   - path_regex: apps/.*\.env$
     age: >-
       YOUR_AGE_PUBLIC_KEY_HERE
+  - path_regex: secrets/.*\.env$
+    age: >-
+      YOUR_AGE_PUBLIC_KEY_HERE

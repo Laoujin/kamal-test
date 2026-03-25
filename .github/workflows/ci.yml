@@ -50,26 +50,16 @@ jobs:
       - name: Create traefik network
         run: docker network create traefik
 
-      - name: Build and deploy
+      - name: Pull health check image
+        run: docker pull curlimages/curl:latest
+
+      - name: Build and deploy (includes health check)
         run: make deploy name=hello-world build=local
 
-      - name: Wait for container to be healthy
+      - name: Test root endpoint via container network
         run: |
-          for i in $(seq 1 30); do
-            if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
-              echo "Health check passed"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "Health check failed after 30s"
-          docker ps -a
-          docker logs hello-world-hello-world-1 || true
-          exit 1
-
-      - name: Test root endpoint
-        run: |
-          response=$(curl -sf http://localhost:8080/)
+          response=$(docker run --rm --network=traefik curlimages/curl:latest \
+            -sf http://hello-world-hello-world-1:8080/)
           echo "Response: $response"
           if [[ "$response" != *"Hello World"* ]]; then
             echo "Unexpected response"
@@ -78,13 +68,6 @@ jobs:
 
       - name: Test make status
         run: make status
-
-      - name: Test make logs (snapshot)
-        run: |
-          docker compose \
-            -f apps/hello-world/src/docker-compose.yml \
-            -f apps/hello-world/docker-compose.override.yml \
-            -p hello-world logs --tail=5
 
       - name: Test make stop
         run: |

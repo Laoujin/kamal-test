@@ -1,4 +1,4 @@
-.PHONY: deploy stop logs status onboard infra-up infra-down help validate
+.PHONY: deploy stop restart logs status onboard update validate infra-up infra-down help
 
 SHELL := /bin/bash
 
@@ -64,12 +64,19 @@ deploy: ## Deploy an app. Usage: make deploy name=hello-world [build=local] [tag
 	else \
 		$(COMPOSE_CMD) $(compose_files) -p $(name) up -d; \
 	fi
-	@# Health check
-	@health_url=$$(grep '^health:' $(app_yaml) | awk '{print $$2}'); \
-	if [ -n "$$health_url" ]; then \
-		echo "==> Waiting for health check ($$health_url)..."; \
+	@# Health check — runs curl in a sidecar on the same Docker network
+	@health_path=$$(grep '^health:' $(app_yaml) | awk '{print $$2}'); \
+	health_port=$$(grep '^port:' $(app_yaml) | awk '{print $$2}'); \
+	if [ -n "$$health_path" ] && [ -n "$$health_port" ]; then \
+		container=$$($(DOCKER_CMD) ps --filter "label=com.docker.compose.project=$(name)" --format '{{.Names}}' | head -1); \
+		if [ -z "$$container" ]; then \
+			echo "==> WARNING: no container found for $(name)"; \
+			exit 1; \
+		fi; \
+		echo "==> Waiting for health check ($$container:$$health_port$$health_path)..."; \
 		for i in $$(seq 1 30); do \
-			if curl -sf "$$health_url" > /dev/null 2>&1; then \
+			if $(DOCKER_CMD) run --rm --network=traefik curlimages/curl:latest \
+				-sf "http://$$container:$$health_port$$health_path" > /dev/null 2>&1; then \
 				echo "==> $(name) is healthy"; \
 				break; \
 			fi; \
@@ -118,21 +125,59 @@ status: ## Show status of all apps
 	@echo "==> Running Containers"
 	@$(DOCKER_CMD) ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
 
-onboard: ## Onboard a new app. Usage: make onboard repo=https://github.com/user/app name=myapp
+onboard: ## Onboard a new app. Usage: make onboard repo=https://github.com/user/app name=myapp [port=8080]
 	@if [ -z "$(name)" ]; then echo "Error: name is required"; exit 1; fi
 	@if [ -z "$(repo)" ]; then echo "Error: repo is required"; exit 1; fi
 	@if [ -d "apps/$(name)" ]; then echo "Error: apps/$(name) already exists"; exit 1; fi
 	@echo "==> Onboarding $(name) from $(repo)..."
 	mkdir -p apps/$(name)
 	git clone --depth 1 $(repo) apps/$(name)/src
+	@# Validate the cloned repo has what we need
+	@if [ ! -f apps/$(name)/src/Dockerfile ] && [ ! -f apps/$(name)/src/docker-compose.yml ]; then \
+		echo "WARNING: no Dockerfile or docker-compose.yml found in repo"; \
+	fi
+	@# Detect port from Dockerfile EXPOSE if not specified
+	$(eval app_port := $(or $(port),$(shell grep -i '^EXPOSE' apps/$(name)/src/Dockerfile 2>/dev/null | head -1 | awk '{print $$2}'),8080))
+	@# Generate app yaml
 	@echo "enabled: true" > $(app_yaml)
 	@echo "repo: $(repo)" >> $(app_yaml)
 	@echo "image: ghcr.io/be-pongit/$(name)" >> $(app_yaml)
 	@echo "domain: $(name).pongit.be" >> $(app_yaml)
-	@echo "==> Created $(app_yaml) — edit domain and image as needed"
-	@echo "==> Create $(app_override) with Traefik labels"
-	@echo "==> Create $(app_env) with secrets"
-	@echo "==> Done. Deploy with: make deploy name=$(name) build=local"
+	@echo "health: /health" >> $(app_yaml)
+	@echo "port: $(app_port)" >> $(app_yaml)
+	@# Generate docker-compose.override.yml
+	@printf 'services:\n' > $(app_override)
+	@printf '  $(name):\n' >> $(app_override)
+	@printf '    ports: !override []\n' >> $(app_override)
+	@printf '    labels:\n' >> $(app_override)
+	@printf '      - "traefik.enable=true"\n' >> $(app_override)
+	@printf '      - "traefik.http.routers.$(name).rule=Host(\x60$(name).pongit.be\x60)"\n' >> $(app_override)
+	@printf '      - "traefik.http.routers.$(name).tls.certresolver=letsencrypt"\n' >> $(app_override)
+	@printf '      - "traefik.http.services.$(name).loadbalancer.server.port=$(app_port)"\n' >> $(app_override)
+	@printf '    env_file:\n' >> $(app_override)
+	@printf '      - path: ../$(name).env.dec\n' >> $(app_override)
+	@printf '        required: false\n' >> $(app_override)
+	@printf '    networks:\n' >> $(app_override)
+	@printf '      - traefik\n' >> $(app_override)
+	@printf '\nnetworks:\n' >> $(app_override)
+	@printf '  traefik:\n' >> $(app_override)
+	@printf '    external: true\n' >> $(app_override)
+	@# Generate empty env file
+	@printf '# Environment variables for $(name)\n' > $(app_env)
+	@echo ""
+	@echo "==> Onboarded $(name)"
+	@echo "    $(app_yaml)"
+	@echo "    $(app_override)"
+	@echo "    $(app_env)"
+	@echo ""
+	@echo "==> Review the generated files, then: make deploy name=$(name) build=local"
+
+update: ## Update app source from git. Usage: make update name=hello-world
+	@if [ -z "$(name)" ]; then echo "Error: name is required"; exit 1; fi
+	@if [ ! -d "$(app_src)/.git" ]; then echo "Error: $(app_src) is not a git repo"; exit 1; fi
+	@echo "==> Updating $(name) source..."
+	git -C $(app_src) pull
+	@echo "==> $(name) source updated. Deploy with: make deploy name=$(name) build=local"
 
 validate: ## Validate all app configs
 	@echo "==> Validating app configs..."
@@ -176,13 +221,24 @@ infra-up: ## Start all infrastructure services
 	@echo "==> Starting infrastructure..."
 	@# Ensure traefik network exists
 	@$(DOCKER_CMD) network inspect traefik >/dev/null 2>&1 || $(DOCKER_CMD) network create traefik
-	@for dir in infra/*/; do \
+	@# Decrypt infra secrets if SOPS-encrypted
+	@if [ -f secrets/infra.env ]; then \
+		if head -1 secrets/infra.env | grep -q "^sops_"; then \
+			echo "  Decrypting infra secrets..."; \
+			sops -d secrets/infra.env > secrets/infra.env.dec; \
+		else \
+			cp secrets/infra.env secrets/infra.env.dec; \
+		fi; \
+		export $$(grep -v '^\s*#' secrets/infra.env.dec | xargs); \
+	fi; \
+	for dir in infra/*/; do \
 		svc=$$(basename $$dir); \
 		if [ -f "$$dir/docker-compose.yml" ]; then \
 			echo "  Starting $$svc..."; \
 			$(COMPOSE_CMD) -f $$dir/docker-compose.yml -p $$svc up -d; \
 		fi; \
-	done
+	done; \
+	rm -f secrets/infra.env.dec
 	@echo "==> Infrastructure up"
 
 infra-down: ## Stop all infrastructure services
