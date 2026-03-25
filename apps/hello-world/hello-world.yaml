@@ -1,0 +1,4 @@
+enabled: true
+repo: local
+image: hello-world:latest
+domain: hello-world.pongit.be

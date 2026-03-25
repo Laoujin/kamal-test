@@ -1,0 +1,14 @@
+services:
+  hello-world:
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.hello-world.rule=Host(`hello-world.pongit.be`)"
+      - "traefik.http.routers.hello-world.tls.certresolver=letsencrypt"
+    env_file:
+      - ../hello-world.env
+    networks:
+      - traefik
+
+networks:
+  traefik:
+    external: true
