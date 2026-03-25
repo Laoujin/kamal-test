@@ -4,127 +4,159 @@
 
 - Synology with Docker installed
 - SSH access to the Synology
-- A domain (pongit.be) with DNS you can edit
-- A dev machine (your WSL Ubuntu)
+- Domain (pongit.be) with DNS you can edit
+- Router access for port forwarding
 
 ## Steps
 
 ### 1. Synology: Docker group
 
-SSH into the Synology and add your user to the docker group:
-
 ```bash
 ssh wouter@<synology-ip>
 sudo usermod -aG docker wouter
-# Log out and back in for it to take effect
 exit
 ssh wouter@<synology-ip>
 docker ps  # should work without sudo
 ```
 
-### 2. Synology: Create the traefik network
+### 2. Synology: Clone this repo
 
 ```bash
 ssh wouter@<synology-ip>
-docker network create traefik
+git clone https://github.com/be-pongit/paas-deploy.git
+cd paas-deploy
 ```
 
-### 3. DNS: Point domains to Synology
+All `make` commands run here, directly on the Synology.
 
-In your DNS provider, add:
+### 3. Router: Forward ports
 
-```
-A  traefik.pongit.be     → <synology-public-ip>
-A  hello-world.pongit.be → <synology-public-ip>
-```
-
-Or a wildcard:
-
-```
-A  *.pongit.be → <synology-public-ip>
-```
-
-### 4. Router: Forward ports
-
-Forward these ports to the Synology's local IP:
+Forward to the Synology's local IP:
 
 ```
 80  → <synology-local-ip>:80
 443 → <synology-local-ip>:443
 ```
 
-### 5. Dev machine: SSH key access
+### 4. DNS
 
-```bash
-ssh-copy-id wouter@<synology-ip>
-# Test it
-ssh wouter@<synology-ip> "docker ps"
+Add to your DNS provider:
+
+```
+A  *.pongit.be → <synology-public-ip>
 ```
 
-### 6. Dev machine: Clone the repo
+Or individual records if you prefer:
 
-```bash
-git clone https://github.com/be-pongit/paas-deploy.git
-cd paas-deploy
+```
+A  traefik.pongit.be   → <synology-public-ip>
+A  grafana.pongit.be   → <synology-public-ip>
+A  vault.pongit.be     → <synology-public-ip>
+A  status.pongit.be    → <synology-public-ip>
+A  pihole.pongit.be    → <synology-public-ip>
 ```
 
-### 7. Start Traefik on the Synology
+### 5. Start infrastructure
 
 ```bash
-make infra-up DEPLOY_HOST=wouter@<synology-ip>
+make infra-up
 ```
 
-This starts Traefik with Let's Encrypt. It auto-creates the traefik network if you skipped step 2.
+This starts Traefik, creates the traefik network, and brings up any other infra services that have compose files.
 
-### 8. Deploy hello-world
+Verify Traefik is running:
 
 ```bash
-make deploy name=hello-world build=local DEPLOY_HOST=wouter@<synology-ip>
+make status
 ```
 
-### 9. Verify
+### 6. Deploy hello-world to test
+
+```bash
+make deploy name=hello-world build=local
+```
+
+You should see the health check pass. Verify:
 
 ```bash
 curl https://hello-world.pongit.be/
-# Should return: Hello World, dev
-
-curl https://hello-world.pongit.be/health
-# Should return 200
 ```
 
-If DNS isn't propagated yet, test directly:
+### 7. Set up SOPS (for secrets)
+
+On the Synology:
 
 ```bash
-curl -H "Host: hello-world.pongit.be" http://<synology-ip>:80/
+# Install age
+sudo apt install age   # or download from https://github.com/FiloSottile/age/releases
+
+# Install sops
+# Download from https://github.com/getsops/sops/releases
+
+# Generate a key
+age-keygen -o ~/.config/sops/age/keys.txt
+# Note the public key it prints
+
+# Edit .sops.yaml — replace YOUR_AGE_PUBLIC_KEY_HERE with your public key
 ```
 
-### 10. Check status
+Then encrypt an env file:
 
 ```bash
-make status DEPLOY_HOST=wouter@<synology-ip>
+sops -e --in-place apps/hello-world/hello-world.env
 ```
 
-## Done
+The Makefile auto-decrypts during deploy and cleans up after.
 
-From here on, deploying any app is:
+### 8. Done
+
+Deploy any app:
 
 ```bash
-make deploy name=<app> DEPLOY_HOST=wouter@<synology-ip>
+make deploy name=<app> build=local    # build from source
+make deploy name=<app>                # pull from GHCR
+make deploy name=<app> tag=v1.2.3     # specific version
+```
+
+Other commands:
+
+```bash
+make status              # what's running
+make logs name=<app>     # tail logs
+make stop name=<app>     # stop an app
+make validate            # check all configs
+```
+
+## Infra Services
+
+| Service | URL | Notes |
+|---|---|---|
+| Traefik | traefik.pongit.be | Reverse proxy, Let's Encrypt |
+| Grafana | grafana.pongit.be | Dashboards, default password: changeme |
+| Uptime Kuma | status.pongit.be | Uptime monitoring |
+| Vaultwarden | vault.pongit.be | Password manager, signups disabled by default |
+| Pi-hole | pihole.pongit.be | DNS + ad blocking, default password: changeme |
+| Loki + Alloy | (internal) | Log aggregation, auto-collects all Docker logs |
+
+Change default passwords by setting env vars before `make infra-up`:
+
+```bash
+GRAFANA_PASSWORD=mysecret PIHOLE_PASSWORD=mysecret make infra-up
 ```
 
 ## Troubleshooting
 
-**"permission denied" on docker commands**
-→ Your user isn't in the docker group. Redo step 1.
+**"permission denied" on docker**
+→ `sudo usermod -aG docker wouter`, then log out and back in.
 
 **"network traefik not found"**
-→ Run `make infra-up` first — it creates the network.
+→ `make infra-up` creates it automatically. Or: `docker network create traefik`
 
 **Let's Encrypt certs not working**
-→ Check ports 80/443 are forwarded. Traefik needs port 80 open for the HTTP challenge.
+→ Ports 80+443 must be forwarded. DNS must point to the Synology. Check `make logs name=traefik` (run from infra: `docker compose -f infra/traefik/docker-compose.yml -p traefik logs`).
 
-**"connection refused" on curl**
-→ Check `make status` to see if the container is running. Check `make logs name=<app>` for errors.
+**Container starts but health check fails**
+→ `make logs name=<app>` to see what's crashing.
 
-**DEPLOY_HOST not connecting**
-→ Test with `ssh wouter@<synology-ip> "docker ps"`. Fix SSH first.
+**Can I deploy from my dev machine instead?**
+→ Yes, for pull-based deploys: `make deploy name=<app> DEPLOY_HOST=wouter@<synology-ip>`. Not recommended for `build=local` — it sends the build context over SSH which is slow.

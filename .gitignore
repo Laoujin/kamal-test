@@ -6,3 +6,4 @@
 .claude/
 _bmad/
 *.env.dec
+.docker-compose.tag.yml

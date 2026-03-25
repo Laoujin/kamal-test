@@ -19,8 +19,9 @@ app_src    = $(app_dir)/src
 app_override = $(app_dir)/docker-compose.override.yml
 app_env    = $(app_dir)/$(name).env
 app_env_dec = $(app_dir)/$(name).env.dec
+app_tag_override = $(app_dir)/.docker-compose.tag.yml
 
-# Compose file args
+# Compose file args (tag override added dynamically in deploy target)
 compose_files = -f $(app_src)/docker-compose.yml -f $(app_override)
 
 help: ## Show this help
@@ -41,21 +42,49 @@ deploy: ## Deploy an app. Usage: make deploy name=hello-world [build=local] [tag
 			cp $(app_env) $(app_env_dec); \
 		fi; \
 	fi
+	@# Build compose file list
+	$(eval extra_files :=)
 	@echo "==> Deploying $(name)..."
 	@if [ "$(build)" = "local" ]; then \
 		echo "==> Building locally..."; \
 		$(COMPOSE_CMD) $(compose_files) build; \
 	elif [ -n "$(tag)" ]; then \
-		echo "==> Using tag: $(tag)"; \
+		image=$$(grep '^image:' $(app_yaml) | awk '{print $$2}'); \
+		echo "==> Using image: $$image:$(tag)"; \
+		svc=$$(grep -E '^\s+\S+:$$' $(app_src)/docker-compose.yml | head -1 | tr -d ' :'); \
+		printf "services:\n  $$svc:\n    image: $$image:$(tag)\n" > $(app_tag_override); \
+		$(COMPOSE_CMD) $(compose_files) -f $(app_tag_override) pull; \
 	else \
 		echo "==> Pulling latest image..."; \
 		$(COMPOSE_CMD) $(compose_files) pull; \
 	fi
 	@echo "==> Starting containers..."
-	$(COMPOSE_CMD) $(compose_files) -p $(name) up -d
-	@echo "==> $(name) deployed successfully"
-	@# Cleanup decrypted secrets
-	@rm -f $(app_env_dec)
+	@if [ -n "$(tag)" ] && [ -f $(app_tag_override) ]; then \
+		$(COMPOSE_CMD) $(compose_files) -f $(app_tag_override) -p $(name) up -d; \
+	else \
+		$(COMPOSE_CMD) $(compose_files) -p $(name) up -d; \
+	fi
+	@# Health check
+	@health_url=$$(grep '^health:' $(app_yaml) | awk '{print $$2}'); \
+	if [ -n "$$health_url" ]; then \
+		echo "==> Waiting for health check ($$health_url)..."; \
+		for i in $$(seq 1 30); do \
+			if curl -sf "$$health_url" > /dev/null 2>&1; then \
+				echo "==> $(name) is healthy"; \
+				break; \
+			fi; \
+			if [ $$i -eq 30 ]; then \
+				echo "==> WARNING: health check failed after 30s"; \
+				$(COMPOSE_CMD) $(compose_files) -p $(name) logs --tail=20; \
+				exit 1; \
+			fi; \
+			sleep 1; \
+		done; \
+	else \
+		echo "==> $(name) deployed (no health check configured)"; \
+	fi
+	@# Cleanup temp files
+	@rm -f $(app_env_dec) $(app_tag_override)
 
 stop: ## Stop an app. Usage: make stop name=hello-world
 	@if [ -z "$(name)" ]; then echo "Error: name is required"; exit 1; fi

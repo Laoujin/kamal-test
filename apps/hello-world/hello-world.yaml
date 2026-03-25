@@ -1,4 +1,5 @@
 enabled: true
 repo: local
-image: hello-world:latest
+image: ghcr.io/be-pongit/hello-world
 domain: hello-world.pongit.be
+health: http://localhost:8080/health
