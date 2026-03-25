@@ -3,3 +3,5 @@
 .kamal/secrets
 .vs/
 *.user
+.claude/
+_bmad/
