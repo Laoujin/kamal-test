@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# paas — CLI for paas-deploy platform
+# Works on Synology DSM (no make required), Linux, WSL
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Docker commands — set DEPLOY_HOST=user@host for remote execution
+if [ -n "${DEPLOY_HOST:-}" ]; then
+  DOCKER_CMD="DOCKER_HOST=ssh://$DEPLOY_HOST docker"
+  COMPOSE_CMD="DOCKER_HOST=ssh://$DEPLOY_HOST docker compose"
+else
+  DOCKER_CMD="docker"
+  COMPOSE_CMD="docker compose"
+fi
+
+# Run a docker command (handles DEPLOY_HOST transparently)
+dock() {
+  if [ -n "${DEPLOY_HOST:-}" ]; then
+    DOCKER_HOST="ssh://$DEPLOY_HOST" docker "$@"
+  else
+    docker "$@"
+  fi
+}
+
+dockc() {
+  if [ -n "${DEPLOY_HOST:-}" ]; then
+    DOCKER_HOST="ssh://$DEPLOY_HOST" docker compose "$@"
+  else
+    docker compose "$@"
+  fi
+}
+
+# App config helpers
+app_dir()      { echo "apps/$1"; }
+app_yaml()     { echo "apps/$1/$1.yaml"; }
+app_src()      { echo "apps/$1/src"; }
+app_override() { echo "apps/$1/docker-compose.override.yml"; }
+app_env()      { echo "apps/$1/$1.env"; }
+app_env_dec()  { echo "apps/$1/$1.env.dec"; }
+app_tag_file() { echo "apps/$1/.docker-compose.tag.yml"; }
+
+compose_files() {
+  echo "-f $(app_src "$1")/docker-compose.yml -f $(app_override "$1")"
+}
+
+yaml_val() {
+  grep "^$2:" "$(app_yaml "$1")" 2>/dev/null | awk '{print $2}'
+}
+
+require_name() {
+  if [ -z "${1:-}" ]; then
+    echo "Error: name is required. Usage: paas $CMD name"
+    exit 1
+  fi
+}
+
+# Decrypt env file: decrypt_env <env_file> <dec_file>
+decrypt_env() {
+  local env_file="$1" dec_file="$2"
+  if [ -f "$env_file" ]; then
+    if head -1 "$env_file" | grep -q "^sops_"; then
+      echo "==> Decrypting secrets..."
+      sops -d "$env_file" > "$dec_file"
+    else
+      cp "$env_file" "$dec_file"
+    fi
+  fi
+}
+
+# Health check using curl sidecar on Docker network
+health_check() {
+  local name="$1"
+  local health_path health_port container
+  health_path=$(yaml_val "$name" "health")
+  health_port=$(yaml_val "$name" "port")
+
+  if [ -n "$health_path" ] && [ -n "$health_port" ]; then
+    container=$(dock ps --filter "label=com.docker.compose.project=$name" --format '{{.Names}}' | head -1)
+    if [ -z "$container" ]; then
+      echo "==> WARNING: no container found for $name"
+      return 1
+    fi
+    echo "==> Waiting for health check ($container:$health_port$health_path)..."
+    for i in $(seq 1 30); do
+      if dock run --rm --network=traefik curlimages/curl:latest \
+        -sf "http://$container:$health_port$health_path" > /dev/null 2>&1; then
+        echo "==> $name is healthy"
+        return 0
+      fi
+      if [ "$i" -eq 30 ]; then
+        echo "==> WARNING: health check failed after 30s"
+        dockc $(compose_files "$name") -p "$name" logs --tail=20
+        return 1
+      fi
+      sleep 1
+    done
+  else
+    echo "==> $name deployed (no health check configured)"
+  fi
+}
+
+# ── Commands ──────────────────────────────────────────────
+
+cmd_deploy() {
+  local name="" build="" tag=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      name=*) name="${1#name=}" ;;
+      build=*) build="${1#build=}" ;;
+      tag=*) tag="${1#tag=}" ;;
+      *) name="${name:-$1}" ;;
+    esac
+    shift
+  done
+
+  require_name "$name"
+  local yaml=$(app_yaml "$name")
+  local src=$(app_src "$name")
+  local env=$(app_env "$name")
+  local dec=$(app_env_dec "$name")
+  local tag_file=$(app_tag_file "$name")
+  local files=$(compose_files "$name")
+
+  [ -f "$yaml" ] || { echo "Error: $yaml not found"; exit 1; }
+
+  local enabled=$(yaml_val "$name" "enabled")
+  [ "$enabled" = "true" ] || { echo "App '$name' is disabled. Set enabled: true in $yaml"; exit 1; }
+
+  # Decrypt secrets
+  decrypt_env "$env" "$dec"
+
+  echo "==> Deploying $name..."
+
+  if [ "$build" = "local" ]; then
+    echo "==> Building locally..."
+    dockc $files build
+  elif [ -n "$tag" ]; then
+    local image=$(yaml_val "$name" "image")
+    echo "==> Using image: $image:$tag"
+    local svc=$(grep -E '^\s+\S+:$' "$src/docker-compose.yml" | head -1 | tr -d ' :')
+    printf "services:\n  $svc:\n    image: $image:$tag\n" > "$tag_file"
+    dockc $files -f "$tag_file" pull
+  else
+    echo "==> Pulling latest image..."
+    dockc $files pull
+  fi
+
+  echo "==> Starting containers..."
+  if [ -n "$tag" ] && [ -f "$tag_file" ]; then
+    dockc $files -f "$tag_file" -p "$name" up -d
+  else
+    dockc $files -p "$name" up -d
+  fi
+
+  health_check "$name"
+
+  # Cleanup temp files
+  rm -f "$dec" "$tag_file"
+}
+
+cmd_stop() {
+  require_name "$1"
+  dockc $(compose_files "$1") -p "$1" down
+}
+
+cmd_restart() {
+  require_name "$1"
+  dockc $(compose_files "$1") -p "$1" restart
+}
+
+cmd_logs() {
+  require_name "$1"
+  dockc $(compose_files "$1") -p "$1" logs -f
+}
+
+cmd_status() {
+  echo "==> App Status"
+  echo ""
+  for dir in apps/*/; do
+    local app=$(basename "$dir")
+    local yaml="$dir$app.yaml"
+    if [ -f "$yaml" ]; then
+      local enabled=$(grep '^enabled:' "$yaml" | awk '{print $2}')
+      if [ "$enabled" = "true" ]; then
+        printf "  %-20s ENABLED\n" "$app"
+      else
+        printf "  %-20s DISABLED\n" "$app"
+      fi
+    fi
+  done
+  echo ""
+  echo "==> Running Containers"
+  dock ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+}
+
+cmd_onboard() {
+  local name="" repo="" port=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      name=*) name="${1#name=}" ;;
+      repo=*) repo="${1#repo=}" ;;
+      port=*) port="${1#port=}" ;;
+      *) ;;
+    esac
+    shift
+  done
+
+  require_name "$name"
+  [ -n "$repo" ] || { echo "Error: repo is required. Usage: paas onboard repo=... name=..."; exit 1; }
+  [ ! -d "apps/$name" ] || { echo "Error: apps/$name already exists"; exit 1; }
+
+  echo "==> Onboarding $name from $repo..."
+  mkdir -p "apps/$name"
+  git clone --depth 1 "$repo" "apps/$name/src"
+
+  # Validate
+  if [ ! -f "apps/$name/src/Dockerfile" ] && [ ! -f "apps/$name/src/docker-compose.yml" ]; then
+    echo "WARNING: no Dockerfile or docker-compose.yml found in repo"
+  fi
+
+  # Detect port from Dockerfile EXPOSE if not specified
+  if [ -z "$port" ]; then
+    port=$(grep -i '^EXPOSE' "apps/$name/src/Dockerfile" 2>/dev/null | head -1 | awk '{print $2}')
+  fi
+  port="${port:-8080}"
+
+  # Generate app yaml
+  local yaml=$(app_yaml "$name")
+  cat > "$yaml" <<YAML
+enabled: true
+repo: $repo
+image: ghcr.io/be-pongit/$name
+domain: $name.pongit.be
+health: /health
+port: $port
+YAML
+
+  # Generate docker-compose.override.yml
+  local override=$(app_override "$name")
+  cat > "$override" <<OVERRIDE
+services:
+  $name:
+    ports: !override []
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.$name.rule=Host(\`$name.pongit.be\`)"
+      - "traefik.http.routers.$name.tls.certresolver=letsencrypt"
+      - "traefik.http.services.$name.loadbalancer.server.port=$port"
+    env_file:
+      - path: ../$name.env.dec
+        required: false
+    networks:
+      - traefik
+
+networks:
+  traefik:
+    external: true
+OVERRIDE
+
+  # Generate empty env file
+  echo "# Environment variables for $name" > "$(app_env "$name")"
+
+  echo ""
+  echo "==> Onboarded $name"
+  echo "    $yaml"
+  echo "    $override"
+  echo "    $(app_env "$name")"
+  echo ""
+  echo "==> Review the generated files, then: ./paas deploy $name build=local"
+}
+
+cmd_update() {
+  require_name "$1"
+  local src=$(app_src "$1")
+  [ -d "$src/.git" ] || { echo "Error: $src is not a git repo"; exit 1; }
+  echo "==> Updating $1 source..."
+  git -C "$src" pull
+  echo "==> $1 source updated. Deploy with: ./paas deploy $1 build=local"
+}
+
+cmd_validate() {
+  echo "==> Validating app configs..."
+  local errors=0
+  for dir in apps/*/; do
+    local app=$(basename "$dir")
+    local yaml="$dir$app.yaml"
+    local override="$dir/docker-compose.override.yml"
+    local src_compose="$dir/src/docker-compose.yml"
+
+    if [ ! -f "$yaml" ]; then
+      echo "  FAIL  $app: missing $yaml"; errors=$((errors+1))
+    else
+      echo "  OK    $app: $yaml"
+    fi
+    if [ ! -f "$override" ]; then
+      echo "  FAIL  $app: missing docker-compose.override.yml"; errors=$((errors+1))
+    else
+      echo "  OK    $app: docker-compose.override.yml"
+    fi
+    if [ ! -f "$src_compose" ]; then
+      echo "  FAIL  $app: missing src/docker-compose.yml"; errors=$((errors+1))
+    else
+      echo "  OK    $app: src/docker-compose.yml"
+    fi
+    if [ -f "$src_compose" ] && [ -f "$override" ]; then
+      if docker compose -f "$src_compose" -f "$override" config > /dev/null 2>&1; then
+        echo "  OK    $app: compose config valid"
+      else
+        echo "  FAIL  $app: compose config invalid"; errors=$((errors+1))
+      fi
+    fi
+  done
+  echo ""
+  if [ $errors -gt 0 ]; then
+    echo "==> $errors error(s) found"; exit 1
+  else
+    echo "==> All apps valid"
+  fi
+}
+
+cmd_infra_up() {
+  echo "==> Starting infrastructure..."
+
+  # Ensure traefik network exists
+  dock network inspect traefik >/dev/null 2>&1 || dock network create traefik
+
+  # Decrypt infra secrets
+  if [ -f secrets/infra.env ]; then
+    if head -1 secrets/infra.env | grep -q "^sops_"; then
+      echo "  Decrypting infra secrets..."
+      sops -d secrets/infra.env > secrets/infra.env.dec
+    else
+      cp secrets/infra.env secrets/infra.env.dec
+    fi
+    set -a
+    source secrets/infra.env.dec
+    set +a
+  fi
+
+  for dir in infra/*/; do
+    local svc=$(basename "$dir")
+    if [ -f "$dir/docker-compose.yml" ]; then
+      echo "  Starting $svc..."
+      dockc -f "$dir/docker-compose.yml" -p "$svc" up -d
+    fi
+  done
+
+  rm -f secrets/infra.env.dec
+  echo "==> Infrastructure up"
+}
+
+cmd_infra_down() {
+  echo "==> Stopping infrastructure..."
+  for dir in infra/*/; do
+    local svc=$(basename "$dir")
+    if [ -f "$dir/docker-compose.yml" ]; then
+      echo "  Stopping $svc..."
+      dockc -f "$dir/docker-compose.yml" -p "$svc" down
+    fi
+  done
+  echo "==> Infrastructure down"
+}
+
+cmd_help() {
+  cat <<'HELP'
+paas — CLI for paas-deploy platform
+
+Usage: ./paas <command> [arguments]
+
+Commands:
+  deploy    Deploy an app           ./paas deploy hello-world build=local
+                                    ./paas deploy hello-world tag=v2026-03-25-abc
+  stop      Stop an app             ./paas stop hello-world
+  restart   Restart an app          ./paas restart hello-world
+  logs      Tail app logs           ./paas logs hello-world
+  status    Show all apps           ./paas status
+  onboard   Onboard a new app       ./paas onboard repo=https://github.com/... name=myapp
+  update    Pull latest source      ./paas update hello-world
+  validate  Check all app configs   ./paas validate
+  infra-up  Start infrastructure    ./paas infra-up
+  infra-down Stop infrastructure    ./paas infra-down
+  help      Show this help          ./paas help
+
+Environment:
+  DEPLOY_HOST=user@host    Run Docker commands on a remote host via SSH
+HELP
+}
+
+# ── Main ──────────────────────────────────────────────────
+
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+  deploy)    cmd_deploy "$@" ;;
+  stop)      cmd_stop "$@" ;;
+  restart)   cmd_restart "$@" ;;
+  logs)      cmd_logs "$@" ;;
+  status)    cmd_status ;;
+  onboard)   cmd_onboard "$@" ;;
+  update)    cmd_update "$@" ;;
+  validate)  cmd_validate ;;
+  infra-up)  cmd_infra_up ;;
+  infra-down) cmd_infra_down ;;
+  help|--help|-h) cmd_help ;;
+  *)
+    echo "Unknown command: $CMD"
+    echo "Run './paas help' for usage"
+    exit 1
+    ;;
+esac
